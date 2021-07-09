@@ -1,24 +1,20 @@
 import os
-import sys
 import boto3
 import json
 import calendar
 from datetime import datetime, date
-from linebot import (LineBotApi, WebhookHandler)
-from linebot.models import (MessageEvent, TextMessage, TextSendMessage,)
-from linebot.exceptions import (LineBotApiError, InvalidSignatureError)
+from linebot import LineBotApi
+from linebot.models import TextSendMessage
 
 ce_client = boto3.client('ce')
 
 # Line API利用に必要な変数設定
-user_id = os.getenv('LINE_USER_ID', None)
 channel_access_token = os.getenv('LINE_CHANNEL_ACCESS_TOKEN', None)
 line_bot_api = LineBotApi(channel_access_token)
 
 
 # 指定した期間のAWS利用料を返す関数
 def get_aws_cost(start_day, end_day):
-
     try:
         response = ce_client.get_cost_and_usage(
             TimePeriod={
@@ -28,14 +24,15 @@ def get_aws_cost(start_day, end_day):
             Granularity='MONTHLY',
             Metrics=['UnblendedCost'],
         )
+        aws_cost = response['ResultsByTime'][0]['Total']['UnblendedCost']['Amount']
+        result_message = create_message(start_day, end_day, aws_cost)
     except Exception as e:
         # boto3 Client error でも以下の文が表示される
         err_res = e.response['Error']['Message']
         message = '[Error]' + '\n' + 'specify up to the past 12 months.'
-        push_message(datetime.strftime(start_day, '%Y-%m-%d') + "-" +
-                     datetime.strftime(end_day, '%Y-%m-%d') + "\n" + message + "\n" + err_res)
-        raise e
-    return response['ResultsByTime'][0]['Total']['UnblendedCost']['Amount']
+        result_message = datetime.strftime(start_day, '%Y-%m-%d') + "-" + datetime.strftime(
+            end_day, '%Y-%m-%d') + "\n" + message + "\n" + err_res
+    return result_message
 
 
 # 指定した年月の初日と最終日を返す関数
@@ -51,19 +48,21 @@ def create_message(start_day, end_day, aws_cost):
     return message
 
 
-# Lineにメッセージを送信する関数
-def push_message(message):
-    messages = TextSendMessage(text=message)
-    line_bot_api.push_message(user_id, messages=messages)
-
 # Main
-
-
 def lambda_handler(event, context):
+    body = json.loads(event['body'])
+    print(body)
 
-    # Lineに入力したテキストを変数に格納
-    # YYYY MMを想定。それ以外は、月初から今日までのAWS利用料金の取得。
-    args = json.loads(event['body'])['events'][0]['message']['text'].split(" ")
+    # Webhookの接続確認用
+    if len(body['events']) == 0:
+        return {
+            'statusCode': 200,
+            'body': ''
+        }
+
+    # (メッセージを返答するときにはreply_tokenを使ってリプライ用のAPIを叩く)
+    args = body['events'][0]['message']['text'].split(" ")
+    reply_token = body['events'][0]['replyToken']
 
     # 引数チェック
     if len(args) == 2:
@@ -75,7 +74,8 @@ def lambda_handler(event, context):
         except ValueError:
             message = '[Error]' + '\n' + \
                 'Incorrect data format, should be YYYY MM'
-            push_message(message)
+            message_obj = TextSendMessage(text=message)
+            line_bot_api.reply_message(reply_token, message_obj)
             raise ValueError(message)
     else:
         year = None
@@ -92,25 +92,33 @@ def lambda_handler(event, context):
         first_last_day = get_frst_last_date(year_int, month_int)
         start_day = date(year_int, month_int, 1)
         end_day = date(year_int, month_int, first_last_day[1])
-        aws_cost = get_aws_cost(start_day, end_day)
 
         # Line送信用メッセージの作成
-        message = create_message(start_day, end_day, aws_cost)
+        # (コスト計算とメッセージ作成はセットなのでまとめたほうがいいかと)
+        message = get_aws_cost(start_day, end_day)
 
-        # Lineにメッセージ送信
-        push_message(message)
+        # Lineにメッセージ返信
+        # (ライブラリのメソッド名を関数名にするのは混乱するのでメイン関数に処理を持ってきた)
+        message_obj = TextSendMessage(text=message)
+        line_bot_api.reply_message(reply_token, message_obj)
 
-        return
+        return {
+            'statusCode': 200,
+            'body': ''
+        }
 
     # 月初から今日までのAWS利用料金の取得
     today = datetime.today()
     first_day = today.replace(day=1)
-    aws_cost = get_aws_cost(first_day, today)
 
     # Line送信用メッセージの作成
-    message = create_message(first_day, today, aws_cost)
+    message = get_aws_cost(first_day, today)
 
     # Lineにメッセージ送信
-    push_message(message)
+    message_obj = TextSendMessage(text=message)
+    line_bot_api.reply_message(reply_token, message_obj)
 
-    return
+    return {
+        'statusCode': 200,
+        'body': ''
+    }
